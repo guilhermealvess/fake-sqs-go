@@ -2,6 +2,7 @@ package lib
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -16,31 +17,32 @@ type SQS interface {
 type queueRouter struct {
 	queue *chan Message
 	dlq   *chan Message
-	stage map[string]*chan bool
+	stage *sync.Map
 }
 
 type ClientSQS struct {
-	routerQueues map[string]queueRouter
-	maxRetries   uint
+	routers    map[string]queueRouter
+	maxRetries uint
 }
 
 func NewClient(limit int64, maxRetries uint, queues ...string) SQS {
-	routerQueues := make(map[string]queueRouter, len(queues))
+	routers := make(map[string]queueRouter, len(queues))
 	for _, queueName := range queues {
 		queue := make(chan Message, limit)
 		dlq := make(chan Message, limit)
-
-		routerQueues[queueName] = queueRouter{
+		var stage sync.Map
+		routers[queueName] = queueRouter{
 			queue: &queue,
 			dlq:   &dlq,
+			stage: &stage,
 		}
 	}
-	return &ClientSQS{routerQueues: routerQueues}
+	return &ClientSQS{routers: routers, maxRetries: maxRetries}
 }
 
 func (c ClientSQS) SendMessage(queueName, data string) error {
 	message := NewMessage(data)
-	route, has := c.routerQueues[queueName]
+	route, has := c.routers[queueName]
 	if !has {
 		return fmt.Errorf("Queue %s not found", queueName)
 	}
@@ -50,18 +52,18 @@ func (c ClientSQS) SendMessage(queueName, data string) error {
 
 func (c ClientSQS) ReceiveMessages(queue string, timeout, maxNum int64) (MessagesOutput, error) {
 	var output MessagesOutput
-	route, has := c.routerQueues[queue]
+	route, has := c.routers[queue]
 	if !has {
 		return output, fmt.Errorf("Queue %s not found", queue)
 	}
 
-	for i := 1; i <= int(maxNum); i++ {
+	for i := 1; i <= int(maxNum) && len(*route.queue) > 0; i++ {
 		msg := <-*route.queue
 		msg.counterProcessed++
 		output.Messages = append(output.Messages, msg)
 
 		ack := make(chan bool)
-		c.routerQueues[queue].stage[*msg.ID] = &ack
+		route.stage.Store(*msg.ID, &ack)
 		go c.observer(queue, &msg, &ack, timeout)
 	}
 
@@ -69,15 +71,16 @@ func (c ClientSQS) ReceiveMessages(queue string, timeout, maxNum int64) (Message
 }
 
 func (c ClientSQS) observer(queue string, message *Message, ack *chan bool, timeout int64) {
-	t := time.After(time.Duration(timeout) * time.Second)
+	//t := time.After(time.Duration(timeout) * time.Second)
 
-	route := c.routerQueues[queue]
+	route := c.routers[queue]
 
 	select {
 	case <-*ack:
-		delete(c.routerQueues[queue].stage, *message.ID)
+		route.stage.Delete(*message.ID)
 		close(*ack)
-	case <-t:
+		return
+	case <-time.After(time.Duration(timeout)*time.Second):
 		if message.counterProcessed == c.maxRetries {
 			message.counterProcessed = 0
 			*route.dlq <- *message
@@ -85,27 +88,28 @@ func (c ClientSQS) observer(queue string, message *Message, ack *chan bool, time
 			message.counterProcessed++
 			*route.queue <- *message
 		}
-		delete(c.routerQueues[queue].stage, *message.ID)
+		route.stage.Delete(*message.ID)
 		close(*ack)
 	}
 }
 
 func (c ClientSQS) AckMessage(queue, messageID string) error {
-	route, has := c.routerQueues[queue]
+	route, has := c.routers[queue]
 	if !has {
 		return fmt.Errorf("Queue %s not found", queue)
 	}
 
-	ack, has := route.stage[messageID]
+	ch, has := route.stage.Load(messageID)
 	if !has {
 		return fmt.Errorf("Message %s not consumed", messageID)
 	}
+	ack, _ := ch.(*chan bool)
 	*ack <- true
 	return nil
 }
 
 func (c ClientSQS) CountMessagesQueue(queue string) (int, error) {
-	if route, has := c.routerQueues[queue]; !has {
+	if route, has := c.routers[queue]; !has {
 		return 0, fmt.Errorf("Queue %s not found", queue)
 	} else {
 		return len(*route.queue), nil
@@ -113,7 +117,7 @@ func (c ClientSQS) CountMessagesQueue(queue string) (int, error) {
 }
 
 func (c ClientSQS) CountMessagesDeadQueue(queue string) (int, error) {
-	if route, has := c.routerQueues[queue]; !has {
+	if route, has := c.routers[queue]; !has {
 		return 0, fmt.Errorf("Queue %s not found", queue)
 	} else {
 		return len(*route.dlq), nil
