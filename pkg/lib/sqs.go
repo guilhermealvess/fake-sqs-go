@@ -10,6 +10,7 @@ type SQS interface {
 	SendMessage(queueName, data string) error
 	ReceiveMessages(queue string, timeout, maxNum int64) (MessagesOutput, error)
 	AckMessage(queue, messageID string) error
+	DLQRedrive(queue string) error
 	CountMessagesQueue(queue string) (int, error)
 	CountMessagesDeadQueue(queue string) (int, error)
 }
@@ -80,7 +81,7 @@ func (c ClientSQS) observer(queue string, message *Message, ack *chan bool, time
 		route.stage.Delete(*message.ID)
 		close(*ack)
 		return
-	case <-time.After(time.Duration(timeout)*time.Second):
+	case <-time.After(time.Duration(timeout) * time.Second):
 		if message.counterProcessed == c.maxRetries {
 			message.counterProcessed = 0
 			*route.dlq <- *message
@@ -105,6 +106,22 @@ func (c ClientSQS) AckMessage(queue, messageID string) error {
 	}
 	ack, _ := ch.(*chan bool)
 	*ack <- true
+	return nil
+}
+
+func (c ClientSQS) DLQRedrive(queue string) error {
+	route, has := c.routers[queue]
+	if !has {
+		return fmt.Errorf("Queue %s not found", queue)
+	}
+
+	dlqLength := len(*route.dlq)
+	for i := 1; i <= dlqLength; i++ {
+		msg := <-*route.dlq
+		msg.counterProcessed = 0
+		*route.queue <- msg
+	}
+
 	return nil
 }
 
